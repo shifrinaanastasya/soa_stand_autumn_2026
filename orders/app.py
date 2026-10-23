@@ -1,12 +1,18 @@
-"""Orders — наивная реализация.
 
-Оформление заказа: зарезервировать товар в Inventory, списать деньги в
-Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
+"""Orders — задания 1 и 2.
 
-Задание 2 (необязательное): об оплаченном заказе сервис сообщает в шину
-событий (order.paid), а за подтверждённую доставку начисляет покупателю
-бонусы. Пока шина работает и Orders не падает, тоже всё работает.
+Задание 1:
+- асинхронное оформление заказа;
+- идемпотентная оплата;
+- Circuit Breaker для Payment.
+
+Задание 2:
+- Transactional Outbox для order.paid;
+- восстановление pending-заказов после перезапуска;
+- идемпотентная обработка delivery.confirmed;
+- бонусы в PostgreSQL.
 """
+
 import queue
 import http.client
 import threading
@@ -20,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
@@ -28,10 +35,12 @@ PORT = int(os.environ.get("PORT", "8080"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 PAYMENT_URL = os.environ["PAYMENT_URL"].rstrip("/")
 INVENTORY_URL = os.environ["INVENTORY_URL"].rstrip("/")
-# Шина событий; пусто — события не публикуются.
 EVENTS_URL = os.environ.get("EVENTS_URL", "").rstrip("/")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("orders")
 
 SCHEMA = """
@@ -43,15 +52,31 @@ CREATE TABLE IF NOT EXISTS orders (
     items        JSONB NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
 CREATE TABLE IF NOT EXISTS bonuses (
     user_id TEXT PRIMARY KEY,
-    points  BIGINT NOT NULL
-)
+    points  BIGINT NOT NULL CHECK (points >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS processed_deliveries (
+    event_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    bonus_points BIGINT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    event_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL UNIQUE,
+    payload JSONB NOT NULL,
+    published BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ
+);
 """
-# Очередь заказов, которые нужно обработать в фоне.
+
 order_queue = queue.Queue()
 
-# Состояние защиты от отказов Payment.
 breaker_lock = threading.Lock()
 payment_failures = 0
 breaker_open_until = 0.0
@@ -60,32 +85,29 @@ breaker_probe_in_progress = False
 FAILURES_TO_OPEN = 1
 BREAKER_COOLDOWN = 10.0
 
+
 def db():
-    return psycopg.connect(DATABASE_URL, autocommit=True)
+    # autocommit=False: операции внутри with db() атомарны.
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
-    # База может подниматься дольше сервиса — ждём её.
     for attempt in range(60):
         try:
             with db() as conn:
                 conn.execute(SCHEMA)
             return
         except psycopg.OperationalError as e:
-            log.info("база недоступна (%s), жду", e)
+            log.info("База недоступна (%s), жду", e)
             time.sleep(1)
-    raise SystemExit("не дождался базы")
+    raise SystemExit("Не удалось подключиться к базе")
 
 
 def call(method, url, body=None, headers=None, timeout=0.7):
     """HTTP-вызов соседнего сервиса с ограничением ожидания."""
     data = json.dumps(body).encode() if body is not None else None
 
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-    )
+    req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
 
     for name, value in (headers or {}).items():
@@ -95,26 +117,34 @@ def call(method, url, body=None, headers=None, timeout=0.7):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else None
-
     except urllib.error.HTTPError as e:
         return e.code, None
 
 
-class PaymentError(Exception):
-    pass
-
-
 def reserve(order_id, items):
-    code, _ = call("POST", f"{INVENTORY_URL}/reservations", {
-        "order_id": order_id,
-        "items": [{"sku": i["sku"], "qty": i["qty"]} for i in items],
-    })
+    code, _ = call(
+        "POST",
+        f"{INVENTORY_URL}/reservations",
+        {
+            "order_id": order_id,
+            "items": [
+                {"sku": item["sku"], "qty": item["qty"]}
+                for item in items
+            ],
+        },
+    )
     if code not in (200, 201):
         raise RuntimeError(f"inventory: {code}")
 
 
 def release(order_id):
-    call("DELETE", f"{INVENTORY_URL}/reservations/{order_id}")
+    code, _ = call(
+        "DELETE",
+        f"{INVENTORY_URL}/reservations/{order_id}",
+    )
+    if code not in (200, 204, 404):
+        log.warning("Не удалось снять резерв %s: HTTP %s", order_id, code)
+
 
 def wait_for_payment():
     global breaker_probe_in_progress
@@ -122,15 +152,13 @@ def wait_for_payment():
     with breaker_lock:
         now = time.monotonic()
 
-        # Circuit Breaker закрыт: запросы разрешены.
         if breaker_open_until == 0.0:
             return True
 
-        # Пауза после отказа ещё не закончилась.
         if now < breaker_open_until:
             return False
 
-        # После паузы пропускаем только один пробный запрос.
+        # После паузы разрешаем только один пробный запрос.
         if breaker_probe_in_progress:
             return False
 
@@ -144,8 +172,8 @@ def payment_result(success):
     global breaker_probe_in_progress
 
     with breaker_lock:
-        # Ответ потерян: не считаем это доказательством
-        # отказа банка, но освобождаем пробную попытку.
+        # Ответ потерян: исход оплаты неизвестен.
+        # Повторяем запрос с прежним ключом идемпотентности.
         if success is None:
             breaker_probe_in_progress = False
             return
@@ -160,21 +188,65 @@ def payment_result(success):
         payment_failures += 1
 
         if payment_failures >= FAILURES_TO_OPEN:
-            breaker_open_until = (
-                time.monotonic() + BREAKER_COOLDOWN
-            )
+            breaker_open_until = time.monotonic() + BREAKER_COOLDOWN
             payment_failures = 0
-            log.warning(
-                "Payment временно отключён Circuit Breaker"
-            )
+            log.warning("Payment временно отключён Circuit Breaker")
+
+
+def charge_once(order_id, amount):
+    """Повторные попытки используют один ключ Idempotency-Key."""
+    code, _ = call(
+        "POST",
+        f"{PAYMENT_URL}/payments",
+        {
+            "order_id": order_id,
+            "amount_cents": amount,
+            "currency": "RUB",
+        },
+        headers={"Idempotency-Key": order_id},
+        timeout=3.0,
+    )
+
+    if code in (200, 201):
+        return "paid"
+    if code == 402:
+        return "declined"
+    if code == 500:
+        return "retry"
+
+    raise RuntimeError(f"Неопределённый результат Payment: HTTP {code}")
 
 
 def update_status(order_id, status):
-    """Сохраняем новый статус заказа."""
     with db() as conn:
         conn.execute(
             "UPDATE orders SET status = %s WHERE id = %s",
             (status, order_id),
+        )
+
+
+def mark_paid_and_enqueue_event(order_id):
+    """Сохраняет paid и outbox-событие в одной транзакции."""
+    event_id = str(uuid.uuid4())
+    payload = {
+        "id": event_id,
+        "type": "order.paid",
+        "order_id": order_id,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE orders SET status = 'paid' WHERE id = %s",
+            (order_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO outbox (event_id, order_id, payload)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (order_id) DO NOTHING
+            """,
+            (event_id, order_id, json.dumps(payload)),
         )
 
 
@@ -190,10 +262,8 @@ def process_order(order_id, items, amount):
         return
 
     if not wait_for_payment():
-        # Не отправляем запросы банку, пока Circuit Breaker открыт.
         with breaker_lock:
             delay = max(0.2, breaker_open_until - time.monotonic())
-
         time.sleep(min(delay, 1.0))
         order_queue.put(job)
         return
@@ -202,14 +272,9 @@ def process_order(order_id, items, amount):
         result = charge_once(order_id, amount)
 
     except http.client.RemoteDisconnected as e:
-        # Payment мог списать деньги, но потерял ответ.
-        # Повторяем запрос с тем же Idempotency-Key.
-        # Circuit Breaker не открываем: это не доказывает,
-        # что сам Payment недоступен.
         payment_result(None)
         log.warning(
-            "Ответ Payment потерян для %s; повторяем "
-            "с тем же ключом идемпотентности: %s",
+            "Ответ Payment потерян для %s; повторяем с тем же ключом: %s",
             order_id,
             e,
         )
@@ -218,19 +283,12 @@ def process_order(order_id, items, amount):
         return
 
     except Exception as e:
-        # Например, тайм-аут при недоступном Payment.
-        # Здесь сохраняем защиту Circuit Breaker для S4.
         payment_result(False)
-        log.warning(
-            "Оплата %s пока не подтверждена: %s",
-            order_id,
-            e,
-        )
+        log.warning("Оплата %s пока не подтверждена: %s", order_id, e)
         time.sleep(random.uniform(0.1, 0.4))
         order_queue.put(job)
         return
 
-    # Получен HTTP-ответ от Payment.
     payment_result(True)
 
     if result == "retry":
@@ -239,59 +297,109 @@ def process_order(order_id, items, amount):
         return
 
     if result == "paid":
-        update_status(order_id, "paid")
-        log.info("Заказ %s оплачен", order_id)
+        # Важно: статус и событие фиксируются одной транзакцией.
+        mark_paid_and_enqueue_event(order_id)
+        log.info("Заказ %s оплачен; событие сохранено в outbox", order_id)
         return
 
-    # Отклоняем заказ только при однозначном отказе банка.
+    # Только однозначный отказ банка приводит к rejected.
     release(order_id)
     update_status(order_id, "rejected")
     log.info("Заказ %s отклонён банком", order_id)
 
+
 def worker():
-    """Постоянно обрабатывает очередь заказов."""
     while True:
         job = order_queue.get()
-
         try:
             process_order(*job)
         except Exception:
             log.exception("Ошибка фоновой обработки заказа")
+            # При сбое БД или другом неожиданном исключении не теряем job.
+            time.sleep(0.5)
+            order_queue.put(job)
         finally:
             order_queue.task_done()
-def charge_once(order_id, amount):
-    """Одна попытка оплаты с постоянным ключом идемпотентности."""
-    code, _ = call(
-        "POST",
-        f"{PAYMENT_URL}/payments",
-        {
-            "order_id": order_id,
-            "amount_cents": amount,
-            "currency": "RUB",
-        },
-        headers={"Idempotency-Key": order_id},
-        timeout=3.0,
-    )
-
-    if code in (200, 201):
-        return "paid"
-
-    if code == 402:
-        return "declined"
-
-    if code == 500:
-        # Банк ответил быстро, но операция не выполнена.
-        # Это повод повторить оплату, а не ждать 8 секунд.
-        return "retry"
-
-    # Тайм-аут и другие неопределённые результаты:
-    # возможно, банк уже выполнил операцию.
-    raise PaymentError(f"payment: {code}")
 
 
-def charge(order_id, amount):
-    """Оставляем совместимый интерфейс для фонового обработчика."""
-    return charge_once(order_id, amount)
+def restore_pending_orders():
+    """Восстанавливает очередь из PostgreSQL после перезапуска."""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, items, amount_cents
+            FROM orders
+            WHERE status = 'pending'
+            ORDER BY created_at
+            """
+        ).fetchall()
+
+    for order_id, items, amount in rows:
+        if isinstance(items, str):
+            items = json.loads(items)
+        order_queue.put((order_id, items, amount))
+
+    if rows:
+        log.info("Восстановлено pending-заказов: %d", len(rows))
+
+
+def outbox_worker():
+    """Публикует сохранённые события и повторяет попытки при сбоях."""
+    while True:
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    """
+                    SELECT event_id, payload
+                    FROM outbox
+                    WHERE published = FALSE
+                    ORDER BY created_at
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+            if row is None:
+                time.sleep(0.2)
+                continue
+
+            event_id, payload = row
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+
+            if not EVENTS_URL:
+                log.warning("EVENTS_URL не задан; событие %s ожидает", event_id)
+                time.sleep(1)
+                continue
+
+            code, _ = call(
+                "POST",
+                f"{EVENTS_URL}/events",
+                payload,
+                timeout=0.7,
+            )
+
+            if code == 202:
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE outbox
+                        SET published = TRUE, published_at = now()
+                        WHERE event_id = %s
+                        """,
+                        (event_id,),
+                    )
+                log.info("Событие %s опубликовано", event_id)
+            else:
+                log.warning(
+                    "Событие %s не опубликовано: HTTP %s",
+                    event_id,
+                    code,
+                )
+                time.sleep(0.5)
+
+        except Exception:
+            log.exception("Ошибка публикации outbox")
+            time.sleep(0.5)
 
 
 def valid(body):
@@ -299,17 +407,23 @@ def valid(body):
         return False
     if not isinstance(body.get("user_id"), str) or not body["user_id"]:
         return False
+
     items = body.get("items")
     if not isinstance(items, list) or not items:
         return False
-    for i in items:
-        if not isinstance(i, dict):
+
+    for item in items:
+        if not isinstance(item, dict):
             return False
-        if not isinstance(i.get("sku"), str) or not i["sku"]:
+        if not isinstance(item.get("sku"), str) or not item["sku"]:
             return False
-        for k, minimum in (("qty", 1), ("price_cents", 0)):
-            v = i.get(k)
-            if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+        for key, minimum in (("qty", 1), ("price_cents", 0)):
+            value = item.get(key)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < minimum
+            ):
                 return False
     return True
 
@@ -321,12 +435,10 @@ def create_order(body):
         for item in body["items"]
     )
 
-    # Сначала сохраняем заказ в БД.
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO orders
-                (id, user_id, status, amount_cents, items)
+            INSERT INTO orders (id, user_id, status, amount_cents, items)
             VALUES (%s, %s, %s, %s, %s)
             """,
             (
@@ -338,52 +450,58 @@ def create_order(body):
             ),
         )
 
-    # HTTP-обработчик только ставит работу в очередь.
     order_queue.put((order_id, body["items"], amount))
-
     return {"id": order_id, "status": "pending"}
 
 
-def publish_paid(order_id):
-    """Сообщает в шину, что заказ оплачен."""
-    if not EVENTS_URL:
-        return
-    try:
-        code, _ = call("POST", f"{EVENTS_URL}/events", {
-            "id": str(uuid.uuid4()),
-            "type": "order.paid",
-            "order_id": order_id,
-            "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
-        if code != 202:
-            log.warning("order %s: событие не опубликовано (%s)", order_id, code)
-    except OSError as e:
-        log.warning("order %s: событие не опубликовано (%s)", order_id, e)
-
-
 def delivery_confirmed(event):
-    """Начисляет бонусы за подтверждённую доставку."""
+    """Начисляет бонусы ровно один раз на уникальный ID события."""
     with db() as conn:
-        conn.execute(
-            "INSERT INTO bonuses (user_id, points) VALUES (%s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET points = bonuses.points + EXCLUDED.points",
-            (event["user_id"], event["bonus_points"]),
-        )
+        inserted = conn.execute(
+            """
+            INSERT INTO processed_deliveries (event_id, user_id, bonus_points)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+            """,
+            (event["id"], event["user_id"], event["bonus_points"]),
+        ).fetchone()
+
+        if inserted is not None:
+            conn.execute(
+                """
+                INSERT INTO bonuses (user_id, points)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET points = bonuses.points + EXCLUDED.points
+                """,
+                (event["user_id"], event["bonus_points"]),
+            )
 
 
 def get_bonus(user_id):
     with db() as conn:
-        row = conn.execute("SELECT points FROM bonuses WHERE user_id = %s", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT points FROM bonuses WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
     return {"points": row[0] if row else 0}
 
 
 def get_order(order_id):
     with db() as conn:
         row = conn.execute(
-            "SELECT id, status, amount_cents FROM orders WHERE id = %s", (order_id,)
+            """
+            SELECT id, status, amount_cents
+            FROM orders
+            WHERE id = %s
+            """,
+            (order_id,),
         ).fetchone()
+
     if row is None:
         return None
+
     return {"id": row[0], "status": row[1], "amount_cents": row[2]}
 
 
@@ -405,44 +523,65 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
             return self.send_json(200, {"status": "ok"})
-        m = ORDER_PATH.match(self.path)
-        if m:
-            order = get_order(m.group(1))
+
+        match = ORDER_PATH.match(self.path)
+        if match:
+            order = get_order(match.group(1))
             if order is None:
                 return self.send_json(404, {"error": "not_found"})
             return self.send_json(200, order)
-        m = BONUS_PATH.match(self.path)
-        if m:
-            return self.send_json(200, get_bonus(urllib.parse.unquote(m.group(1))))
+
+        match = BONUS_PATH.match(self.path)
+        if match:
+            user_id = urllib.parse.unquote(match.group(1))
+            return self.send_json(200, get_bonus(user_id))
+
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self):
         if self.path not in ("/orders", "/webhooks/delivery"):
             return self.send_json(404, {"error": "not_found"})
-        length = int(self.headers.get("Content-Length") or 0)
+
         try:
+            length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"null")
-        except ValueError:
+        except (ValueError, TypeError):
             body = None
+
         if self.path == "/webhooks/delivery":
             return self.webhook(body)
+
         if not valid(body):
             return self.send_json(400, {"error": "bad_request"})
+
         try:
-            self.send_json(201, create_order(body))
+            result = create_order(body)
+            self.send_json(201, result)
         except Exception as e:
             log.exception("POST /orders")
             self.send_json(500, {"error": "internal", "message": str(e)})
 
     def webhook(self, body):
-        if not isinstance(body, dict) or not isinstance(body.get("user_id"), str) \
-                or not isinstance(body.get("bonus_points"), int) or body["bonus_points"] <= 0:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("id"), str)
+            or not body["id"]
+            or body.get("type") != "delivery.confirmed"
+            or not isinstance(body.get("user_id"), str)
+            or not body["user_id"]
+            or not isinstance(body.get("bonus_points"), int)
+            or isinstance(body.get("bonus_points"), bool)
+            or body["bonus_points"] <= 0
+        ):
             return self.send_json(400, {"error": "bad_request"})
+
         try:
             delivery_confirmed(body)
-        except Exception as e:
+        except Exception:
             log.exception("POST /webhooks/delivery")
-            return self.send_json(500, {"error": "internal", "message": str(e)})
+            return self.send_json(500, {"error": "internal"})
+
+        # Повтор уже обработанного события тоже подтверждаем 2xx.
         self.send_json(200, {"status": "ok"})
 
     def log_message(self, fmt, *args):
@@ -451,19 +590,14 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    restore_pending_orders()
 
-    # Поднимаем работников до начала приёма запросов.
     for _ in range(4):
-        thread = threading.Thread(
-            target=worker,
-            daemon=True,
-        )
-        thread.start()
+        threading.Thread(target=worker, daemon=True).start()
 
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        Handler,
-    )
+    threading.Thread(target=outbox_worker, daemon=True).start()
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
 
     log.info("orders: слушаю :%d", PORT)
